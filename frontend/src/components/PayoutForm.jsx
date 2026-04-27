@@ -29,8 +29,13 @@ function PayoutForm({ merchant, onPayoutCreated }) {
       setError(null);
       setSuccess(null);
 
-      await payoutAPI.createPayout(merchant.id, amountPaise, selectedBankAccount);
+     console.log("Sending bank account:", selectedBankAccount);
 
+await payoutAPI.createPayout(
+  merchant.id,
+  amountPaise,
+  selectedBankAccount
+);
       setSuccess(`Payout of ₹${amountRupees.toFixed(2)} created successfully!`);
       setAmount('');
       onPayoutCreated();

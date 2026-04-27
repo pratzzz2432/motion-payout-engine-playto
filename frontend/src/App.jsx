@@ -55,11 +55,12 @@ function App() {
   };
 
   const handlePayoutCreated = () => {
-    // Refresh merchant details after payout creation
-    if (selectedMerchant) {
-      fetchMerchantDetails(selectedMerchant);
-    }
-  };
+  if (selectedMerchant) {
+    fetchMerchantDetails(selectedMerchant);
+  }
+  // optional page-level nudge for history refresh:
+  window.location.reload();
+ };
 
   if (loading && !merchants.length) {
     return (

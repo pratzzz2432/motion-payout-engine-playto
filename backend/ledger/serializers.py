@@ -59,7 +59,7 @@ class PayoutCreateSerializer(serializers.Serializer):
     Serializer for creating payout requests.
     """
     amount_paise = serializers.IntegerField(min_value=1)
-    bank_account_id = serializers.UUIDField()
+    bank_account_id = serializers.IntegerField()
 
     def validate_amount_paise(self, value):
         """
