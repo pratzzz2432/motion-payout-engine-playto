@@ -8,5 +8,5 @@ router.register(r'merchants/(?P<merchant_id>[^/.]+)/ledger', LedgerEntryViewSet,
 
 urlpatterns = [
     path('', include(router.urls)),
-    path('merchants/<uuid:merchant_id>/payouts/', PayoutAPIView.as_view(), name='payout-list-create'),
+    path('merchants/<int:merchant_id>/payouts/', PayoutAPIView.as_view(), name='payout-list-create'),
 ]
