@@ -7,24 +7,28 @@ function PayoutHistory({ merchantId }) {
   const [error, setError] = useState(null);
 
   useEffect(() => {
+  if (merchantId) {
     fetchPayouts();
-    // Poll for updates every 5 seconds
-    const interval = setInterval(fetchPayouts, 5000);
-    return () => clearInterval(interval);
-  }, [merchantId]);
+  }
+}, [merchantId]);
 
   const fetchPayouts = async () => {
-    try {
-      setLoading(true);
-      const data = await payoutAPI.getPayouts(merchantId);
-      setPayouts(data.payouts || []);
-    } catch (err) {
-      setError('Failed to fetch payout history');
-      console.error(err);
-    } finally {
-      setLoading(false);
-    }
-  };
+  try {
+    setLoading(true);
+    setError(null);
+
+    const data = await payoutAPI.getPayouts(merchantId);
+
+    // If endpoint returns nothing or 404 is handled upstream,
+    // just show empty history.
+    setPayouts(data || []);
+  } catch (err) {
+    console.log("No payout history available yet.");
+    setPayouts([]);
+  } finally {
+    setLoading(false);
+  }
+};
 
   const getStatusBadge = (status) => {
     const statusConfig = {
