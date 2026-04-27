@@ -129,24 +129,9 @@ def create_test_merchants():
 
 
 if __name__ == '__main__':
-    # Clear existing data (optional - comment out if you want to keep data)
-    print("Warning: This will delete all existing merchants and ledger entries.")
-    response = input("Do you want to continue? (yes/no): ")
+    print("Auto-seeding demo data...")
 
-    if response.lower() == 'yes':
-        print("\nDeleting existing data...")
-        LedgerEntry.objects.all().delete()
-        Payout.objects.all().delete()
-        BankAccount.objects.all().delete()
-        Merchant.objects.all().delete()
-        print("✓ Existing data deleted\n")
-
+    if Merchant.objects.count() == 0:
         create_test_merchants()
     else:
-        print("Cancelled. Adding new data without deleting...")
-
-        # Check if any merchants exist
-        if Merchant.objects.count() == 0:
-            create_test_merchants()
-        else:
-            print("Merchants already exist. Skipping seed.")
+        print("Merchants already exist. Skipping seed.")
