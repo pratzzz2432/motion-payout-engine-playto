@@ -436,11 +436,3 @@ If I were to continue building this:
 ## License
 
 This project is for the Playto Founding Engineer Challenge 2026.
-
-## Contact
-
-For questions about this submission, please reach out through the challenge submission form.
-
----
-
-**Built with ❤️ for the Playto Founding Engineer Challenge**
