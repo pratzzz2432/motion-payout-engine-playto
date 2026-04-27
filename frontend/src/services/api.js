@@ -34,10 +34,10 @@ export const merchantAPI = {
 
 export const payoutAPI = {
   // Get all payouts for a merchant
-  getPayouts: async (merchantId) => {
-    const response = await api.get(`/merchants/${merchantId}/payouts/`);
-    return response.data;
-  },
+getPayouts: async (merchantId) => {
+  const response = await api.get(`/merchants/${merchantId}/payouts/`);
+  return response.data.results || [];
+},
 
   // Create a new payout request
   createPayout: async (merchantId, amountPaise, bankAccountId) => {
