@@ -58,8 +58,6 @@ function App() {
   if (selectedMerchant) {
     fetchMerchantDetails(selectedMerchant);
   }
-  // optional page-level nudge for history refresh:
-  window.location.reload();
  };
 
   if (loading && !merchants.length) {
