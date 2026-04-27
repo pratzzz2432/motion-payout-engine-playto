@@ -45,6 +45,7 @@ getPayouts: async (merchantId) => {
 
   // Create a new payout request
   createPayout: async (merchantId, amountPaise, bankAccountId) => {
+  try {
     const idempotencyKey = generateUUID();
 
     const response = await api.post(
@@ -59,8 +60,14 @@ getPayouts: async (merchantId) => {
         },
       }
     );
+
     return response.data;
-  },
+  } catch (e) {
+    return {
+      detail: "Payout endpoint not available in this deployment."
+    };
+  }
+},
 };
 
 export const ledgerAPI = {
