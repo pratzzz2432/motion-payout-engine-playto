@@ -187,40 +187,37 @@ class Payout(models.Model):
     def __str__(self):
         return f"Payout {self.id} - {self.merchant.name} - ₹{self.amount_paise / 100:.2f} ({self.status})"
 
-def clean(self):
-    # New objects: only allow PENDING
-    if self._state.adding:
-        if self.status != 'PENDING':
+    def clean(self):
+    # For brand new payouts
+        if self._state.adding:
+            if self.status != 'PENDING':
+                raise ValidationError({
+                    "status": "New payouts must be created with PENDING status."
+                })
+            return
+
+    # For existing payouts only
+        try:
+            old_instance = Payout.objects.get(pk=self.pk)
+        except Payout.DoesNotExist:
+            return
+
+        old_status = old_instance.status
+        new_status = self.status
+
+        valid_transitions = {
+            'PENDING': ['PROCESSING'],
+            'PROCESSING': ['COMPLETED', 'FAILED'],
+            'COMPLETED': [],
+            'FAILED': [],
+        }
+
+        if new_status not in valid_transitions.get(old_status, []):
             raise ValidationError({
-                "status": "New payouts must be created with PENDING status."
+                "status": f"Invalid state transition from {old_status} to {new_status}"
             })
-        return
 
-    # Existing objects only
-    try:
-        old_instance = Payout.objects.get(pk=self.pk)
-    except Payout.DoesNotExist:
-        return
-
-    old_status = old_instance.status
-    new_status = self.status
-
-    valid_transitions = {
-        'PENDING': ['PROCESSING'],
-        'PROCESSING': ['COMPLETED', 'FAILED'],
-        'COMPLETED': [],
-        'FAILED': [],
-    }
-
-    if new_status not in valid_transitions.get(old_status, []):
-        raise ValidationError({
-            "status": f"Invalid state transition from {old_status} to {new_status}"
-        })
-
-    if new_status not in valid_transitions.get(old_status, []):
-        raise ValidationError({
-            "status": f"Invalid state transition from {old_status} to {new_status}"
-        })
+    
     def save(self, *args, **kwargs):
         self.full_clean()
         super().save(*args, **kwargs)
