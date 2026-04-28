@@ -54,7 +54,9 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
-
+CORS_ALLOWED_ORIGINS = [
+    "https://motion-payout-engine-playto-1.onrender.com",
+]
 ROOT_URLCONF = 'payout_engine.urls'
 
 TEMPLATES = [
