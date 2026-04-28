@@ -21,9 +21,9 @@ function generateUUID() {
 export const merchantAPI = {
   // Get all merchants
   getMerchants: async () => {
-    const response = await api.get('/merchants/');
-    return response.data;
-  },
+  const response = await api.get('/merchants/');
+  return response.data.results || [];
+},
 
   // Get merchant details with balances
   getMerchantDetails: async (merchantId) => {
