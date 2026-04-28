@@ -191,7 +191,7 @@ class Payout(models.Model):
         """
         Validate state transitions.
         """
-        if not self.pk:
+        if self._state.adding:
             # New payout, can only be created as PENDING
             if self.status != 'PENDING':
                 raise ValidationError({"status": "New payouts must be created with PENDING status."})
