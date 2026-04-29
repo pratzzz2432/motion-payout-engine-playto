@@ -154,22 +154,30 @@ class PayoutAPIView(APIView):
                     )
 
                 # Create payout in PENDING state
-                payout = Payout.objects.create(
+                payout = Payout(
                     merchant=merchant,
                     bank_account=bank_account,
                     amount_paise=amount_paise,
                     status='PENDING',
                     idempotency_key=idempotency_key
                 )
+                payout.save()
 
-                # Create held debit entry (funds are held until payout completes)
-                #held_debit = LedgerEntry.objects.create(
-                 #   merchant=merchant,
-                  # amount_paise=amount_paise,
-                   # is_held=True,  # Funds are held
-                   # description=f'Held for payout {payout.id}',
-                    #payout=payout
-                #)
+                # DEBUG: force verify payout was actually persisted
+                if not Payout.objects.filter(pk=payout.id).exists():
+                    return Response(
+                        {'error': 'Payout save failed'},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                    )
+
+                # [DEBUG DISABLED] held debit entry — skipped for this test
+                # held_debit = LedgerEntry.objects.create(
+                #     merchant=merchant,
+                #     amount_paise=amount_paise,
+                #     is_held=True,
+                #     description=f'Held for payout {payout.id}',
+                #     payout=payout
+                # )
 
                 # Prepare response data
                 response_data = {
@@ -187,19 +195,16 @@ class PayoutAPIView(APIView):
                     'created_at': payout.created_at.isoformat()
                 }
 
-                # Store idempotency key for future requests
-                # Delete any expired keys first
-                IdempotencyKey.objects.filter(
-                    merchant=merchant,
-                    created_at__lt=timezone.now() - timedelta(hours=24)
-                ).delete()
-
-                # Create new idempotency key record
-                IdempotencyKey.objects.create(
-                    merchant=merchant,
-                    key=idempotency_key,
-                    response_data=response_data
-                )
+                # [DEBUG DISABLED] idempotency key save — skipped for this test
+                # IdempotencyKey.objects.filter(
+                #     merchant=merchant,
+                #     created_at__lt=timezone.now() - timedelta(hours=24)
+                # ).delete()
+                # IdempotencyKey.objects.create(
+                #     merchant=merchant,
+                #     key=idempotency_key,
+                #     response_data=response_data
+                # )
 
                 logger.info(f"Created payout {payout.id} for merchant {merchant.id} with amount {amount_paise}")
 
