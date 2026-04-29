@@ -248,7 +248,6 @@ class Payout(models.Model):
             })
 
     def save(self, *args, **kwargs):
-        self.full_clean()
         super().save(*args, **kwargs)
 
     def should_retry(self):
