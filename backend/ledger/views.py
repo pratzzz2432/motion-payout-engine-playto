@@ -163,14 +163,13 @@ class PayoutAPIView(APIView):
                 )
 
                 # Create held debit entry (funds are held until payout completes)
-                held_debit = LedgerEntry.objects.create(
-                    merchant=merchant,
-                    entry_type='DEBIT',
-                    amount_paise=amount_paise,
-                    is_held=True,  # Funds are held
-                    description=f'Held for payout {payout.id}',
-                    payout=payout
-                )
+                #held_debit = LedgerEntry.objects.create(
+                 #   merchant=merchant,
+                  # amount_paise=amount_paise,
+                   # is_held=True,  # Funds are held
+                   # description=f'Held for payout {payout.id}',
+                    #payout=payout
+                #)
 
                 # Prepare response data
                 response_data = {
