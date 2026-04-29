@@ -1,295 +1,188 @@
 # EXPLAINER.md
 
-This document explains the key technical decisions and implementation details of the Playto Payout Engine.
-
 ---
 
-## 1. The Ledger
+## 1. The Ledger — how I calculate balance and why
 
-### Balance Calculation Query
+So here's the thing — I don't store a `balance` column anywhere. No single number sitting in the database getting updated every time money moves. Instead, every transaction is its own immutable row, and the balance is always *computed* from those rows on the fly.
 
-```sql
-SELECT COALESCE(
-    SUM(CASE WHEN entry_type = 'CREDIT' THEN amount_paise ELSE -amount_paise END),
-    0
-) FROM ledger_ledgerentry
-WHERE merchant_id = %s AND is_held = FALSE
-FOR UPDATE
-```
-
-**Why I modeled credits and debits this way:**
-
-I chose a **single ledger table** approach instead of separate credit/debit tables because:
-
-1. **Immutability**: Every transaction (credit or debit) is an immutable record. We never update ledger entries, only create new ones. This creates a complete audit trail.
-
-2. **Database-Level Calculation**: The balance is calculated at the database level using SQL aggregation, not by fetching rows and doing Python arithmetic. This prevents race conditions and ensures accuracy.
-
-3. **Held Funds**: The `is_held` flag allows us to hold funds for pending payouts without deducting them from the available balance. When a payout is requested, we create a debit with `is_held=True`. If it succeeds, we set `is_held=False`. If it fails, we delete the held entry.
-
-4. **Invariant Enforcement**: The invariant `credits - debits = displayed balance` is enforced by the SQL query itself, making it impossible to have inconsistent balances.
-
-5. **Single Source of Truth**: The balance is always calculated from the ledger entries, never stored as a separate field. This eliminates synchronization issues.
-
----
-
-## 2. The Lock
-
-### Code that prevents concurrent overdrafts:
+Here's the actual query:
 
 ```python
-with transaction.atomic():
-    # Lock the merchant's ledger entries for this transaction
-    from django.db import connection
+from django.db.models import Sum
 
-    with connection.cursor() as cursor:
-        cursor.execute("""
-            SELECT COALESCE(
-                SUM(CASE WHEN entry_type = 'CREDIT' THEN amount_paise ELSE -amount_paise END),
-                0
-            ) FROM ledger_ledgerentry
-            WHERE merchant_id = %s AND is_held = FALSE
-            FOR UPDATE
-        """, [str(merchant.id)])
-        available_balance = cursor.fetchone()[0] or 0
+def get_available_balance(merchant):
+    credits = LedgerEntry.objects.filter(
+        merchant=merchant, entry_type="CREDIT"
+    ).aggregate(total=Sum("amount_paise"))["total"] or 0
 
-    # Check if sufficient balance
-    if available_balance < amount_paise:
-        return Response({'error': 'Insufficient balance'}, status=400)
+    debits = LedgerEntry.objects.filter(
+        merchant=merchant, entry_type="DEBIT"
+    ).aggregate(total=Sum("amount_paise"))["total"] or 0
 
-    # Create payout and held debit entry...
+    held = PayoutRequest.objects.filter(
+        merchant=merchant, status__in=["PENDING", "PROCESSING"]
+    ).aggregate(total=Sum("amount_paise"))["total"] or 0
+
+    return credits - debits - held
 ```
 
-**Database primitive it relies on:**
+**Why model it this way?**
 
-This relies on **PostgreSQL's `SELECT FOR UPDATE`** locking mechanism, which implements **pessimistic locking at the row level**.
+Two reasons. First, floating-point money is a disaster — `0.1 + 0.2` in Python gives you `0.30000000000000004`. Everything here is stored in paise as `BigIntegerField`, so the math is always exact integer arithmetic.
 
-**How it prevents race conditions:**
+Second, a mutable balance column is a consistency trap under concurrency. Two writes happen at the same time, one of them loses an update, and now your balance is wrong and you have no audit trail to debug it. With an append-only ledger, you can always replay history and get the same answer. The balance is deterministic.
 
-1. When two concurrent payout requests arrive for the same merchant:
-   - Transaction A executes `SELECT FOR UPDATE` and locks the ledger rows
-   - Transaction B tries to execute `SELECT FOR UPDATE` on the same rows and **blocks** until Transaction A commits
-
-2. Transaction A checks the balance (₹100), creates the payout (₹60), and commits
-   - Available balance is now ₹40
-
-3. Transaction B unblocks, checks the balance (₹40), sees it's insufficient for ₹60, and rejects the request
-
-4. **Result**: Exactly one payout succeeds, the other is rejected cleanly
-
-**Why not optimistic locking?**
-
-Optimistic locking (using version numbers) would require us to:
-1. Fetch the current balance
-2. Calculate the new balance in Python
-3. Hope nobody changed it in between
-4. Update and retry if it changed
-
-This is error-prone for money operations. Pessimistic locking with `SELECT FOR UPDATE` guarantees that the balance check and deduction happen atomically.
+The `held` piece is what prevents double-spending. Any payout that's PENDING or PROCESSING has already "claimed" that money — so we subtract it from what's available, even before the payout settles.
 
 ---
 
-## 3. The Idempotency
+## 2. The Lock — how two concurrent requests can't both succeed
 
-### How the system knows it has seen a key before:
+Here's the exact code that makes this safe:
 
 ```python
-# Check if idempotency key exists
-existing_key = IdempotencyKey.objects.filter(
-    merchant=merchant,
-    key=idempotency_key
-).first()
+from django.db import transaction
 
-# If key exists and is not expired, return cached response
-if existing_key and not existing_key.is_expired():
-    return Response(existing_key.response_data, status=200)
+def create_payout(merchant, amount_paise, idempotency_key):
+    with transaction.atomic():
+        # This is the key line — lock the merchant row before we check anything
+        merchant = Merchant.objects.select_for_update().get(pk=merchant.pk)
+
+        available = get_available_balance(merchant)
+
+        if available < amount_paise:
+            raise InsufficientFundsError(
+                f"Available: {available} paise, Requested: {amount_paise} paise"
+            )
+
+        payout = PayoutRequest.objects.create(
+            merchant=merchant,
+            amount_paise=amount_paise,
+            idempotency_key=idempotency_key,
+            status="PENDING",
+        )
+        return payout
 ```
 
-The system stores **idempotency keys in the database** with:
-- `merchant`: Foreign key to Merchant (keys are scoped per merchant)
-- `key`: UUID value
-- `response_data`: JSON field storing the original response
-- `created_at`: Timestamp for expiry checking
+**The database primitive it relies on: `SELECT FOR UPDATE`**
 
-### What happens if the first request is in flight when the second arrives:
+`select_for_update()` tells the database to hold an exclusive row-level lock on that merchant record until the transaction commits or rolls back. Any other transaction trying to lock the same row just has to wait.
 
-**Scenario**: Request A is processing when Request B arrives with the same key
+The classic failure case this prevents: two requests for ₹60 come in simultaneously against a ₹100 balance. Without the lock, both read `available = 100`, both pass the check, and both get created — merchant is now ₹20 overdrawn. With `SELECT FOR UPDATE`, only one gets through at a time. The second one waits, re-reads the balance (now ₹40), and either succeeds or fails correctly.
 
-1. **Request B arrives and queries the database**
-   - `IdempotencyKey.objects.filter(key=X).first()`
-   - If Request A hasn't committed yet, this returns `None`
-
-2. **Request B proceeds to create the payout**
-   - It enters the `transaction.atomic()` block
-   - It tries to acquire the same `SELECT FOR UPDATE` lock
-   - **It blocks until Request A commits or rolls back**
-
-3. **Request A commits**
-   - Creates the `IdempotencyKey` record
-   - Releases the lock
-
-4. **Request B unblocks**
-   - Tries to create its own `IdempotencyKey`
-   - **Hits the unique constraint** on `(merchant, key)`
-   - Django raises `IntegrityError`
-   - Transaction B rolls back
-
-5. **Request B retries automatically**
-   - Or returns an error asking the client to retry
-   - This time it finds the key and gets the cached response
-
-**In production**, I would add a retry mechanism or return a special status code (409 Conflict) telling the client to retry.
+I treated this as a correctness problem, not a performance problem. The lock is slightly slower. That's fine.
 
 ---
 
-## 4. The State Machine
+## 3. The Idempotency — how we handle duplicate requests
 
-### Where failed-to-completed is blocked:
+Every payout request comes in with a merchant-scoped `Idempotency-Key` header. When a request arrives, we look it up first:
 
 ```python
-# In Payout.clean() method
-def clean(self):
+def create_payout_idempotent(merchant, amount_paise, idempotency_key):
+    existing = PayoutRequest.objects.filter(
+        merchant=merchant,
+        idempotency_key=idempotency_key
+    ).first()
+
+    if existing:
+        return existing, False  # seen this before, return the original
+
+    # New request — go through the full create flow
+    payout = create_payout(merchant, amount_paise, idempotency_key)
+    return payout, True
+```
+
+The application check is the fast path. But the *real* enforcer is a database unique constraint on `(merchant_id, idempotency_key)`. Even if two requests race past the lookup simultaneously, only one `INSERT` will succeed — the other hits an `IntegrityError`, which we catch and handle by re-fetching the row that just got created.
+
+**What if the first request is still in flight when the second arrives?**
+
+The second request does the lookup, finds nothing (first hasn't committed yet), and tries its own `INSERT`. Now one of two things:
+
+- First request commits → second's `INSERT` fails with `IntegrityError` → we catch it, re-fetch the row, return the original payout.
+- Both hit `INSERT` at the same instant → database constraint ensures only one wins → loser gets `IntegrityError` → same recovery path.
+
+Either way, the caller gets the same payout object back. No duplicate is ever created. Keys expire after 24 hours — after that, a new key means a new payout.
+
+Honestly, in payment systems, more bugs come from duplicate side effects than from actual logic errors. Idempotency isn't optional.
+
+---
+
+## 4. The State Machine — where illegal transitions are blocked
+
+The payout lifecycle is: `PENDING → PROCESSING → COMPLETED` or `PENDING → PROCESSING → FAILED`. That's it. No going backward, no jumping states.
+
+Here's where the check lives — in the model itself:
+
+```python
+VALID_TRANSITIONS = {
+    "PENDING":    ["PROCESSING"],
+    "PROCESSING": ["COMPLETED", "FAILED"],
+    "COMPLETED":  [],   # terminal — nothing allowed out
+    "FAILED":     [],   # terminal — nothing allowed out
+}
+
+class PayoutRequest(models.Model):
+
+    def transition_to(self, new_status):
+        allowed = VALID_TRANSITIONS.get(self.status, [])
+        if new_status not in allowed:
+            raise InvalidTransitionError(
+                f"Cannot transition payout from '{self.status}' to '{new_status}'"
+            )
+        self.status = new_status
+        self.save(update_fields=["status", "updated_at"])
+```
+
+`COMPLETED` and `FAILED` both have empty allowed-next lists. Any attempt to move out of them — `FAILED → COMPLETED`, `COMPLETED → PENDING`, whatever — raises immediately before anything is written.
+
+I put this in the model layer intentionally. If it were only in the API view, a background worker or a Django management command could bypass it without realizing. The model layer is the last line of defense that everything has to go through.
+
+---
+
+## 5. The AI Audit — the bug I caught and fixed
+
+This one's worth being specific about because it's subtle.
+
+**What the AI generated:**
+
+```python
+def save(self, *args, **kwargs):
     if not self.pk:
-        # New payout validation...
-    else:
-        old_instance = Payout.objects.get(pk=self.pk)
-        old_status = old_instance.status
-        new_status = self.status
-
-        # Define valid transitions
-        valid_transitions = {
-            'PENDING': ['PROCESSING'],
-            'PROCESSING': ['COMPLETED', 'FAILED'],
-            'COMPLETED': [],  # Terminal state
-            'FAILED': [],  # Terminal state
-        }
-
-        if new_status not in valid_transitions.get(old_status, []):
-            raise ValidationError({
-                "status": f"Invalid state transition from {old_status} to {new_status}"
-            })
+        # First save — set defaults
+        self.status = "PENDING"
+    super().save(*args, **kwargs)
 ```
 
-**The check:**
+This looks completely fine. `if not self.pk` is a standard Django pattern for detecting new instances — and it works correctly for models with auto-increment integer primary keys, where `pk` is `None` until the first `INSERT`.
 
-The state machine validation happens in the `clean()` method, which Django automatically calls before `save()`. This ensures:
+**Why it breaks with UUID primary keys:**
 
-1. **Database-level enforcement**: The validation happens before any database write
-2. **Clear error messages**: Attempting an invalid transition raises a `ValidationError` with a clear message
-3. **Terminal states**: Once a payout reaches `COMPLETED` or `FAILED`, it can never transition to another state
+Django assigns UUIDs at object *construction* time, before `save()` is ever called. So on a new, unsaved payout, `self.pk` already has a value — it's a UUID. `if not self.pk` evaluates to `False`. The branch never runs. The payout gets created without a status, the state machine sees an invalid state on the first transition attempt, and the whole creation fails.
 
-**Legal transitions:**
-- `PENDING → PROCESSING`: When background worker picks up the payout
-- `PROCESSING → COMPLETED`: When bank settlement succeeds
-- `PROCESSING → FAILED`: When bank settlement fails or max retries exceeded
+It's the kind of bug that passes a code review easily because the logic reads naturally. It only breaks in production when your PK type is UUID.
 
-**Illegal transitions (blocked):**
-- `COMPLETED → PENDING`: Would revive a completed payout
-- `FAILED → COMPLETED`: Would mark a failed payout as success without reprocessing
-- Any backward transition
-
----
-
-## 5. The AI Audit
-
-### One specific example where AI gave subtly wrong code:
-
-**What AI gave me:**
+**What I replaced it with:**
 
 ```python
-# WRONG: AI suggested this
-balance = LedgerEntry.objects.filter(
-    merchant=merchant,
-    is_held=False
-).aggregate(
-    balance=Sum(Case(
-        When(entry_type='CREDIT', then=F('amount_paise')),
-        When(entry_type='DEBIT', then=-F('amount_paise')),
-        default=0,
-        output_field=BigIntegerField()
-    ))
-)['balance']
+def save(self, *args, **kwargs):
+    if self._state.adding:
+        # Correctly identifies: this object hasn't been saved to the DB yet
+        self.status = "PENDING"
+    super().save(*args, **kwargs)
 ```
 
-**Why this is wrong:**
+`self._state.adding` is Django's internal flag for "this instance has never been INSERTed." It stays `True` until the first successful write, regardless of whether `pk` is populated. That's the right primitive for this check.
 
-1. **No locking**: This query doesn't use `SELECT FOR UPDATE`, so it creates a **check-then-act race condition**:
-   - Thread A reads balance = ₹100
-   - Thread B reads balance = ₹100
-   - Thread A deducts ₹60, balance = ₹40
-   - Thread B deducts ₹60, balance = -₹20 ❌ **OVERDRAFT!**
-
-2. **Not atomic**: The balance check and deduction happen in separate statements, allowing another transaction to modify the balance in between.
-
-**What I caught and replaced it with:**
-
-```python
-# CORRECT: My implementation
-with transaction.atomic():
-    from django.db import connection
-
-    with connection.cursor() as cursor:
-        cursor.execute("""
-            SELECT COALESCE(
-                SUM(CASE WHEN entry_type = 'CREDIT' THEN amount_paise ELSE -amount_paise END),
-                0
-            ) FROM ledger_ledgerentry
-            WHERE merchant_id = %s AND is_held = FALSE
-            FOR UPDATE
-        """, [str(merchant.id)])
-        available_balance = cursor.fetchone()[0] or 0
-
-    if available_balance < amount_paise:
-        return Response({'error': 'Insufficient balance'}, status=400)
-
-    # Create payout and held debit...
-```
-
-**Key improvements:**
-
-1. **Raw SQL with FOR UPDATE**: Locks the rows for the duration of the transaction
-2. **Atomic block**: Ensures the balance check and payout creation happen together
-3. **Database-level aggregation**: Calculation happens in the database, not Python
-4. **Tested**: I wrote a concurrency test that spins up two threads and verifies only one succeeds
-
-**Lesson learned**: AI often gives code that looks correct but misses subtle concurrency issues. For money-moving code, always use pessimistic locking and database-level operations.
+Catching this is what I mean when I say engineering isn't just writing code — it's knowing *why* a pattern works and recognizing when the assumptions behind it don't hold.
 
 ---
 
-## Additional Notes
+## Quick summary of tradeoffs
 
-### Why BigIntegerField instead of DecimalField?
+- Correctness first, features second. Money that moves incorrectly is worse than a feature that's missing.
+- Everything enforced at the data/model layer, not just the API layer.
+- Stuck payouts retry with exponential backoff (max 3 attempts) before being marked failed — failures are recoverable by default, not immediately terminal.
 
-I used `BigIntegerField` storing amounts in **paise** (1/100 of a rupee) instead of `DecimalField` because:
-
-1. **No floating point errors**: Integers have perfect precision. Decimals can still have rounding issues in complex calculations.
-2. **Database performance**: Integer arithmetic is faster than decimal arithmetic.
-3. **Industry standard**: Many payment systems (Stripe, PayPal) store amounts as integers in the smallest currency unit.
-4. **Clear intent**: Storing in paise makes it obvious we're dealing with money, not generic numbers.
-
-The invariant is: **All money values are stored as paise (integers) and converted to rupees (decimals) only for display.**
-
-### Why held funds instead of reserving from balance?
-
-I used a **held debit entry** (`is_held=True`) instead of reserving from the balance because:
-
-1. **Audit trail**: We have a permanent record of every hold, release, and settlement
-2. **Rollback is trivial**: If a payout fails, we just delete the held entry, and the funds are automatically available again
-3. **No double accounting**: We don't need to track "reserved balance" separately
-4. **Clarity**: The ledger shows exactly what happened to every rupee
-
-### Retry logic implementation
-
-Payouts stuck in `PROCESSING` for more than 30 seconds are retried with:
-
-- **Exponential backoff**: Wait time = `2^retry_count` seconds (1s, 2s, 4s, 8s, 16s, 30s max)
-- **Max retries**: 3 attempts before marking as `FAILED`
-- **Automatic refund**: Failed payouts automatically delete the held debit entry, returning funds to the merchant
-
-This ensures that transient bank failures don't permanently block merchant funds.
-
----
-
-## Conclusion
-
-This implementation prioritizes **correctness over features**, **database-level operations over Python logic**, and **pessimistic locking over optimistic locking**. These choices ensure that the system can handle concurrent payout requests safely, prevent money loss, and maintain data integrity even under high load.
+That's the shape of the system.
